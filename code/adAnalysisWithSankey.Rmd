@@ -1,0 +1,399 @@
+---
+title: "Ad Analysis with Sankey Charts"
+author: "Craig 'Doc' Savage"
+date: "26 April 2019"
+output: 
+  html_document: 
+    code_folding: hide
+    toc: yes
+    toc_depth: 2
+---
+
+```{r setup, include=TRUE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+# Executive Summary
+
+Journeys are a fundamental part of a customer's experience. Often, these journeys are described in terms of online behaviours - seeing an ad, clicking on it, researching a product, and finally buying. A [kernel by ChrisBow](https://www.kaggle.com/chrisbow/an-introduction-to-facebook-ad-analysis-using-r) explains several aspects of assessing advertising campaigns with visualisations primarily through the `ggplot` package.
+
+As an alternative, Sankey plots are presented as an alternative means of visualising customer performance. In this kernel, I go through the [Google Chart Sankey diagram](https://developers.google.com/chart/interactive/docs/gallery/sankey) utilising the [`googleVis` package](https://cran.r-project.org/web/packages/googleVis/vignettes/googleVis.pdf) in R. Other options are considered from the `ggalluvial` and `networkD3` packages.
+
+# Introduction {.tabset .tabset-fade .tabset-pills}
+
+If you're running this at home, you may have trouble getting `googleVis` charts to work with knitting to HTML via `rmarkdown` if you're running an old version of RStudio and its associated pandoc. As you might expect, there's a [solution on StackOverflow](https://stackoverflow.com/questions/46278465/googlevis-in-markdown-throws-error-67) which involves updating `pandoc.` Or you can try updating RStudio.
+
+## Package Load 
+
+I've tried to use few packages for the main plots. I've focussed primarily on the `googleVis` package but there are examples with `ggalluvial` and `networkD3` at the end of the document.
+
+The packages here are:    
+1. `tidyverse`: I'm at the point where I include this as a matter-of-course. The bundled tools are almost always part of my code.  
+2. `googleVis`: The `gvisSankey` is my focus in this kernel. You can find more information on the `googleVis` package on [my YouTube channel](https://youtu.be/xXwhOqbrrzg). I'll be making another video about Sankey charts "soon".  
+3. `ggalluvial` and `networkD3`: Other packages I've used to produce Sankey plots. If you know of more, I'd be interested in hearing about them in the comments!  
+4. `scales`: Useful for formatting numbers in various ways (e.g. percents, money, comma-delimited, etc.).  
+5. `knitr`: I use `kable` for a table. I think you should have `knitr` anyway if you're using `rmarkdown`, but I've formally included it in the package load.  
+
+```{r packageLoad}
+# tidyverse for the general data wrangling functions (mainly dplyr)
+library( tidyverse )
+# googleVis for the Sankey charts
+# Note this requires an Internet connection, if using Windows, pandoc 2.0
+# Simply using library( googleVis ) will produce messages about the usage 
+suppressPackageStartupMessages( library( googleVis ) )
+# ggalluvial for alternate Sankey
+library( ggalluvial )
+# networkD3 for other alternate Sankey
+library( networkD3 )
+# scales for easy numeric display
+library( scales )
+# knitr for the kable function for tables. You should have knitr for use with rmarkdown, anyway....
+library( knitr )
+```
+
+## Data load 
+
+Loading the data is perfomed in the standard Kaggle manner. I've used `read_csv` as `readr` is included in the `tidyverse`. 
+
+```{r dataLoad}
+rawSankeyData <- readr::read_csv( '../input/KAG_conversion_data.csv' )
+sankeyData <- rawSankeyData %>%
+  # Convert the ID fields to characters
+  mutate( xyzCampaignID=as.character( xyz_campaign_id )
+          # Include a dummy "Total" column
+          , Total='Total' )
+```
+
+## Wrangling Function
+
+The basic idea of wrangling the data to be compatible with `googleVis::gvisSankey` is to repeatedly build the data in terms of data flows. Here, I've defined a function to augment a data frame (or tibble) with various metrics. While I won't explicitly show all of these metrics in graphics, I do have other plans for them....
+
+![Picture: The cartoon character "Dick Dastardly" laughing with apparent mischievous intent.](https://media.giphy.com/media/25GN8GZ7KP3ZYnHgIJ/giphy.gif)
+
+
+```{r functionDefinition}
+sankeyLevel <- function( sankeyData, fromVar, toVar ){
+  # See vignette( 'programming', package='dplyr' ) for more information as to how this works
+  fromVar <- enquo( fromVar )
+  toVar <- enquo( toVar )
+  
+  levelData <- sankeyData %>%
+    group_by( From = !! fromVar, To=!! toVar ) %>%
+    summarise( nImpressions=sum( Impressions )
+               , nClicks=sum( Clicks )
+               , nTotalConversion=sum( Total_Conversion )
+               , nSold=sum( Approved_Conversion )
+               , totalSpend=sum( Spent )
+    ) %>% 
+    mutate( clickThroughRate=nClicks/nImpressions 
+               , costPerClick=totalSpend/nClicks
+               , costPerSale=totalSpend/nSold )
+ 
+  return( levelData )
+}
+```
+
+With this function, I have a standardised way to build summary data sets. For the Sankey graph, it will then be a matter of binding subsequent rows together, one for each stage in the graph.
+
+
+
+# Data Concerns
+
+My preference for visualisations using Sankey plots is to show customer journeys. Conceptually, a journey might be:  
+1. Customer sees an ad from a given campaign.  
+2. Customer clicks on said ad.  
+3. Customer "converts" (by whatever definition - filling a form, putting something in their shopping cart, etc.)  
+4. Conversion is approved.  
+
+This is my preference for using Sankey plots - there's a distinct journey, and we can see what fraction of customers make it to each stage. Unfortunately, there are some challenges with the data provided.
+
+I'll channel my inner teacher and leave these cases with a rather glib "These are exercises for the reader."
+
+## Clickless Conversions
+
+There are some conversions that didn't occur through clicks - I found this by looking at the first few rows:    
+
+```{r clickless1}
+knitr::kable( head( rawSankeyData %>% select( ad_id, Clicks, Total_Conversion, Approved_Conversion ) ), caption='Quick look at the first few rows of input data.' )
+```
+
+Note the third and sixth rows have no clicks but do have conversions. We can filter the data to show such cases.
+
+```{r clickless2}
+clicklessConversions <- rawSankeyData %>%
+  filter( Clicks == 0, Total_Conversion > 0 | Approved_Conversion > 0 )
+```
+
+
+There are `r nrow( clicklessConversions )` such rows in the data set. It's unclear (to me) how these happened - customers visiting a website directly after seeing an ad? Perhaps the campaign is e-mail? I'd want to understand this before plotting customer journeys.
+
+## Journey Scales
+
+The scale of impressions is much larger than clicks or total conversions - with rates of `r scales::percent( sum( rawSankeyData$Clicks )/sum( rawSankeyData$Impressions ) )` and `r scales::percent( sum( rawSankeyData$Total_Conversion )/sum( rawSankeyData$Impressions) )`, respectively. Hence, a Sankey visualisation will have be quite sparse, with a large number of `Impressions` not going anywhere. 
+
+## Granularity
+
+There are some other variables in the data set that might be useful, such as `fb_campaign_id` and `interest`. However, these are both quite granular with `r n_distinct( rawSankeyData$fb_campaign_id )` and `r n_distinct( rawSankeyData$interest )` distinct values, respectively. Again, it's possible to incorporate these factors to show how the `Impressions` cascade through the network, but it will be a very busy graph. As such, I've omitted these for this kernel, and leave them to the interested reader to expand on the tools included within this kernel to make such visualisations.    
+
+# Sankey Plots with `googleVis` {.tabset .tabset-fade .tabset-pills}
+
+My primary focus is the creation and customisation of Sankey plots using the `googleVis` package. I've included some other packages (namely `ggalluvial` and `networkD3`) in the next secion. My reasons for prioritising `googleVis` include:    
+1. **Documented**: Documentation for [Google Charts](https://developers.google.com/chart/) and the [corresponding `googleVis` package](https://cran.r-project.org/web/packages/googleVis/vignettes/googleVis.pdf) is extensive and, in my opinion, well-written.    
+2. **Configurable**: The links of the Sankey diagram are configurable with HTML, allowing for bespoke visualisations, tooltips, and colours.   
+
+
+There are also drawbacks:  
+1. **Internet requirement**: Because `googleVis` hits the Google Charts API, an Internet connection is required to render the graphs. Hence, the graphs might not be available if the user if offline.    
+2. **Interpretation to Javascript**: This is an R package to an API that is primarily Javascript. As a result, there can be unexpected results when attempting to configure the graphs. This is amplified once `pandoc` is added to produce HTML output, or `shiny` is used for interactive graphs, etc. Like many aspects of data science, things that work well in general might behave unexpectedly in isolated cases.
+
+## Base Plot
+
+The first plot utilises the `sankeyLevel` function, which I've defined in Wrangling Function within the Introduction. The data are built repeatedly, from Total to Campaign, then Campaign to gender, and, finally, gender to age. After stacking the data, our data are ready for plotting! I've downselected the variables at this stage for visualisation, but the myriad of metrics are still there.
+
+Note there is tooltip information on mouseover enabled in the base plot. By default, this gives (From) -> (To) and the weight.
+
+```{r baseSankey, results='asis', tidy=FALSE}
+    sankeyData1 <- sankeyLevel( sankeyData, Total, xyzCampaignID )
+    sankeyData2 <- sankeyLevel( sankeyData, xyzCampaignID, gender )
+    sankeyData3 <- sankeyLevel( sankeyData, gender, age )
+    
+    fullPlotData <- bind_rows( sankeyData1, sankeyData2, sankeyData3 )  
+    plotData <- fullPlotData %>% select( From, To, nClicks )
+    
+    sankeyPlot <- gvisSankey( plotData
+                              , from='From'
+                              , to='To'
+                              , weight='nClicks' )
+    print( sankeyPlot, tag='chart' ) 
+```
+
+## Configuring the Graph
+
+The Sankey graph can be configured to make it look as you wish. A list of options is included with the [Google Charts documentation for Sankey charts](https://developers.google.com/chart/interactive/docs/gallery/sankey). Getting them to work within `googleVis` is a bit more involved, and requires some care as the type of setting being modified.
+
+The documentation of the Introduction has the following advice:
+
+>Generally, the following rules apply:    
+> • parameters with names that do not include a ”.” are set with a single value,
+e.g. width and height. Those are set like one would do in R, that is options=list(width=200, height=300). Boolean arguments are set to either TRUE or FALSE, using the R syntax.    
+> • parameters with names that do not include a ”.” and are set with multiple values, e.g. color, and are wrapped in ”[ ]”, e.g. options=list( colors="[’#cbb69d’, ’#603913’, ’#c69c6e’]")    
+> • parameters with names that do include a ”.” present parameters with several sub-options and have to be set as a string wrapped in ”{ }”. The values of those sub-options are set via parameter:value. Boolean values have to be stated as ’true’ or ’false’. For example the Google documentaion states the formating options for the vertical axis and states the parameter as vAxis.format. Then this paramter can be set in R as: options=list( vAxis="{format:’#,###%’}").   
+> • If several sub-options have to be set, e.g. titleTextStyle.color, titleTextStyle.fontName and titleTextStyle.fontSize, then those can be
+combined in one list item such as: options=list( titleTextStyle="{color:’red’, fontName:’Courier’, fontSize:16}")    
+> • paramters that can have more than one value per sub-options are wrapped in ”[ ]”. For example to set the labels for left and right axes use: options=list(vAxes="[{title:’val1’}, {title:’val2’}]")   
+
+In general, I've found trial-and-error an effective way to customise the graphs. Note that the syntax can be unforgiving in terms of spaces, line breaks, and other things you may try to make the options readable. I've also included an additional field, `nSold`, representing the number of approved conversions (I've taken the liberty of calling the "sold"). Note that this information is automatically appended to the tooltip.
+
+```{r sankeyConfig, results='asis', tidy=FALSE}
+plotData2 <- fullPlotData %>% 
+  select( From, To, nClicks, nSold )
+
+sankeyColourPlot <- gvisSankey( plotData2
+                                , from='From'
+                                , to='To'
+                                , weight='nClicks' 
+                                , options=list(width=800 # Make it bigger - standard R notation for a list
+                                               # Set link and node information as different parts of a "sankey" configuration
+                                               # Here, I've changed two parts of the sankey setting. 
+                                              , sankey="{link: {colorMode:'gradient'}, node: {label: { fontSize: 18, color: '554A3C'}, nodePadding: 50 } }"
+                                )
+                                )
+
+plot( sankeyColourPlot, tag='chart' )
+```
+
+## Tooltips
+
+The default tooltips are useful for display. But, as you've seen in the function definition, there's a large number of metrics we'd like to visualise. By employing and configuring HTML tooltips, we can do this explicitly. Within the Google Charts library, additional fields are considered as part of the tooltip information. We can explicitly build this information by including `.tooltip` in the name of the column of our data frame. Hence, I've included some additional information in the data to utilise the tooltip.
+
+The numbers and values are placeholders, as I don't know the context of what an "acceptable" value would be.
+
+```{r tooltipSankey, results='asis', tidy=FALSE}
+toolPlotData <-  fullPlotData %>%
+  mutate( # Add colour information for RAG (Red, Amber, Green) status of cost per click, cost per sale
+    # I've made up the numbers for illustration purposes only
+    costPerClickRAG=case_when( costPerClick < 1.5 ~ 'Green'
+                               , costPerClick < 2 ~ 'Gold'
+                               , TRUE ~ 'Red' )
+    , costPerSaleRAG=case_when( costPerSale < 25 ~ 'Green'
+                                , costPerSale < 50 ~ 'Gold'
+                                , TRUE ~ 'Red' )
+    # Include tooltip information 
+    , sankey.tooltip=paste( 'Impressions:', scales::comma( nImpressions ), '<br>'
+                            , 'Clicks:', scales::comma( nClicks ), '<br>'
+                            , 'Total Conversions:', scales::comma( nTotalConversion ), '<br>'
+                            , 'Approved Conversions:', nSold, '<br>'
+                            , 'Cost:', scales::dollar( totalSpend ), '<br>'
+                            # As I'll be using HTML-enabled tooltips, add some colour
+                            , '<div  style="color:', costPerClickRAG, '">', 'CPC:', scales::dollar( costPerClick ), '</div>'
+                            , '<div style="color:', costPerSaleRAG, '">', 'CPS:', scales::dollar( costPerSale ), '</div>' )
+  )
+
+sankeyTooltipPlot <- gvisSankey( toolPlotData
+                                 , from='From'
+                                 , to='To'
+                                 # Make the width of the flows proportional to the number of Impressions rather than clicks
+                                 , weight='nImpressions'
+                                 , options=list( width=800  
+                                              # Enable HTML tooltips - note the capitialisation convention!
+                                              , tooltip="{isHtml: 'TRUE'}"
+                                              # Set the colour of the link to be the same as its source and configure the text of the link.
+                                              , sankey="{link: {colorMode:'source'}, node: {label: { fontSize: 18, color: '554A3C'}, nodePadding: 50 } }"
+                                   )                                   
+                                 )
+
+plot( sankeyTooltipPlot, tag='chart' )
+```
+
+## Relative Values
+
+So far, I've used the Sankey diagrams to convey the absolute levels and numbers of each link. However, we can expand the tooltip to include relative weights as well. I've re-defined the `sankeyLevel` function as `sankeyLevel2`, which stretched the limits of my naming creativity, in order to easily track relative information.
+
+```{r relativeSankey, results='asis'}
+## Modify the sankeyLevel function to also include relative values
+sankeyLevel2 <- function( sankeyData, fromVar, toVar ){
+  # See vignette( 'programming' ) for more information as to how this works
+  fromVar <- enquo( fromVar )
+  toVar <- enquo( toVar )
+  
+  levelData <- sankeyData %>%
+    group_by( From = !! fromVar, To=!! toVar ) %>%
+    summarise( nImpressions=sum( Impressions )
+               , nClicks=sum( Clicks )
+               , nTotalConversion=sum( Total_Conversion )
+               # I'm calling Approved_Conversion "sold" even though it might not be.
+               # It is easier to visualise, though...
+               , nSold=sum( Approved_Conversion )
+               , totalSpend=sum( Spent )
+    ) %>% 
+    mutate( clickThroughRate=nClicks/nImpressions 
+            , costPerClick=totalSpend/nClicks
+            , costPerSale=totalSpend/nSold
+            # Note that we've done a single summarise, so there is still a group_by( From ) 
+            # We can use sum() within a mutate to get level totals
+            , fromClicks=sum( nClicks )
+            , fromImpressions=sum( nImpressions )
+            , fromSold = sum( nSold )
+            # Calculate the relative values
+            , relClicks=nClicks/fromClicks
+            , relImpressions=nImpressions/fromImpressions
+            , relSold = nSold/fromSold ) %>%
+    # Remove the grouping for clean data for future processing
+    ungroup()
+  
+  return( levelData )
+}
+
+    sankeyData1 <- sankeyLevel2( sankeyData, Total, xyzCampaignID )
+    sankeyData2 <- sankeyLevel2( sankeyData, xyzCampaignID, gender )
+    sankeyData3 <- sankeyLevel2( sankeyData, gender, age )
+    
+    fullPlotData <- bind_rows( sankeyData1, sankeyData2, sankeyData3 )
+    plotData2 <- fullPlotData %>%
+        mutate( # Add colour information for RAG (Red, Amber, Green) status of cost per click, cost per sale
+    # I've made up the numbers for illustration purposes only
+    costPerClickRAG=case_when( costPerClick < 1.5 ~ 'Green'
+                               , costPerClick < 2 ~ 'Gold'
+                               , TRUE ~ 'Red' )
+    , costPerSaleRAG=case_when( costPerSale < 25 ~ 'Green'
+                                , costPerSale < 50 ~ 'Gold'
+                                , TRUE ~ 'Red' )
+    # Include tooltip information - this will be used automatically with the '.tooltip' in the name
+    , sankey.tooltip=paste( 'Impressions:', scales::comma( nImpressions ), '<br>'
+                            , 'Fraction impressions from ', From, ':', scales::percent( relImpressions ), '<br>'
+                            , 'Clicks:', scales::comma( nClicks ), '<br>'
+                            , 'Fraction clicks from ', From, ':', scales::percent( relClicks ), '<br>'
+                            , 'Total Conversions:', scales::comma( nTotalConversion ), '<br>'
+                            , 'Approved Conversions:', nSold, '<br>'
+                            , 'Cost:', scales::dollar( totalSpend ), '<br>'
+                            # Create a div in the tooltip for fun
+                            , '<div  style="color:', costPerClickRAG, '">', 'CPC:', scales::dollar( costPerClick ), '</div>'
+                            # Be a bit more creative with the tooltip for more fun
+                            , '<div style="background-color:', costPerSaleRAG, '">', 'CPS:', scales::dollar( costPerSale ), '</div>' )
+  )
+
+  relSankey <- gvisSankey( plotData2
+                           , from='From'
+                           , to='To'
+                           , weight = 'nImpressions'
+                           # Options are the same as the previous Sankey
+                           , options=list( width=800
+                                           , tooltip="{isHtml: 'TRUE'}"
+                                           , sankey="{link: {colorMode:'source'}, node: {label: { fontSize: 18, color: '554A3C'}, nodePadding: 50 } }" 
+                                           )
+  )
+  
+  plot( relSankey, tag='chart' )
+```
+
+# Other Sankey Plot Options
+
+Let's say you like the graphs presented, but for whatever reason, don't like using the `googleVis` package. There are some other options, including the `ggalluvial` and `networkD3` packages.
+
+## The `ggalluvial` Package
+
+The `ggalluvial` package lets one make plots with `ggplot`-like syntax. I don't use it because it has some of the same problems - mainly the lack of interactive tooltips. But, for sake of demonstration:
+
+```{r ggalluvialSankey}
+# Note the syntax - each stage of the Sankey gets its own "axis" for flow
+alluvExample <- ggplot( sankeyData, aes( y=Impressions, axis1=xyzCampaignID, axis2=gender, axis3=age ) ) + 
+  scale_x_discrete( limits=c('Campaign', 'Gender', 'Age' ) ) + 
+  geom_stratum() + 
+  # I've added a colour gradient to the links 
+  geom_flow( aes( fill=..y.. ) ) +
+  geom_text( stat='stratum', label.strata=TRUE ) +
+  theme( legend.position='none' )
+
+alluvExample
+```
+
+## The `networkD3` Package
+
+As the `networkD3` package is based on the `D3.js` framework, this is an extremely powerful package. However, with that power comes the pain of configuring. Perhaps this will feel more natural to you if you're a javascript programmer, but I prefer the ease of using data frames/tibbles everywhere.  
+
+As a visualisation, I prefer it to the `ggalluvial` package, as there are tooltips. I'm sure it's possible to configure them as in `gvisSankey` but I haven't spent the time to get into it. The tooltips may take a while to appear once you mouseover the links, but they work for me. 
+
+As a demonstration:
+
+```{r networkD3Sankey, message=FALSE, warning=FALSE, results='asis'}
+# Generate a list of nodes and indices (0-based)
+nodeDF <- data.frame( NodeID=union( unique( plotData$From ), unique( plotData$To ) ) ) %>%
+  mutate( NodeIDX=row_number() - 1 )
+
+# Get the node information into the link data frame
+linkData <- plotData %>% 
+  inner_join( nodeDF, by=c('From'='NodeID' ) ) %>% 
+  rename( sourceIDX=NodeIDX ) %>% 
+  inner_join( nodeDF, by=c('To'='NodeID') ) %>% 
+  rename( targetIDX=NodeIDX ) %>%
+  as.data.frame()
+
+# Add some group columns to nodeDF
+nodeDF$NodeGroup <- c('Total', 'Campaign', 'Campaign', 'Campaign', 'Gender', 'Gender', 'Age', 'Age', 'Age', 'Age' )
+
+# ...and some group information to the links - here based on the number of clicks (hence, the width of the flow)
+linkData$LinkGroup <- cut( linkData$nClicks, 4 )
+
+d3Example <- sankeyNetwork( Links=linkData, Nodes=nodeDF, Source='sourceIDX', Target='targetIDX', Value='nClicks', NodeGroup = 'NodeGroup', LinkGroup = 'LinkGroup' )
+
+d3Example
+```
+
+# Insight Summary
+
+Of course, I'm not making these plots *only* because I think they're pretty -- I'd rather use the `circlize` package for [fancy plots](https://jokergoo.github.io/circlize_book/book/index.html). I'd like to conclude by insights I've received from these plots, with these as an example:
+
+* **Quick assessment of distributions**: Most of the impressions/clicks are from females, with a plurality of women aged 45-49. There are no data for ages of 50+ nor under 30 - neither men nor women. Although 1178 is the most represented campaign, it is not the one with the "best" results in terms of cost per click/conversion.        
+* **Detailed assessment of metrics**: With HTML-based tooltips, we can include as much information on each stream as desired. Furthermore, as they're HTML-enabled, we can colour code, add pictures, or other such details. For that matter, the documentation includes [examples of Google charts in tooltips](https://developers.google.com/chart/interactive/docs/customizing_tooltip_content#placing-charts-in-tooltips). Unfortunately, I haven't yet learned how to enable that through R.    
+* **Migration**: If there's a change in customer rating, Sankey plots can show the "swap set" of customers migrating from one scheme to another. Note, however, that the `googleVis` package requires the `from` and `to` fields to be distinct; there can be no degenerate migrations. You can get around this by labelling the states with, say, "Previous" and "Proposed", or more subtlely including an extra space at the end of the values in the `to` column.  
+
+# Acknowledgements
+
+Special thanks to the following:
+
+* The kernel entitled ["An Introduction to Facebook ad analysis using R"]((https://www.kaggle.com/chrisbow/an-introduction-to-facebook-ad-analysis-using-r)) by ChrisBow, which I recommend for more detail about the concepts included in the tooltips within this kernel. 
+* The developers of Google Charts for opening the API.   
+* Markus Gesmann and Diego de Castillo for developing the `googleVis` package and writing extensive documentation and examples. As they've asked to be formally cited:
+> Markus Gesmann and Diego de Castillo. *Using the Google Visualisation API with R*. **The R Journal**, 3(2):40-44, December 2011.   
+* The anonymous data depositor who contribued the data.    
+* Kaggle for hosting the data and the kernels, and for the creation and hosting of its data science community.   
